@@ -52,7 +52,7 @@
     <p>Grab passengers, rush them to your <b>depot</b>, and grow your bus into a monster train. Ram into other buses' <b>bodies</b> and they'll spill their riders!</p>
     <input type="text" id="nameIn" maxlength="10" placeholder="Your name" value="You">
     <div class="swatches" id="swatches"></div>
-    <p style="font-size:13px"><b>Steer:</b> mouse / touch / WASD / arrows &nbsp; <b>Boost:</b> Space / click / button<br>Gold riders are worth 5!</p>
+    <p style="font-size:13px"><b>Steer:</b> drag (touch or mouse) / WASD / arrows &nbsp; <b>Boost:</b> Space / hold BOOST bar<br>Gold riders are worth 5!</p>
     <button id="playBtn">PLAY!</button>
   </div>
 </div>
@@ -159,6 +159,7 @@ function startGame(){
   document.getElementById('menu').classList.add('hidden');
   document.getElementById('end').classList.add('hidden');
   beep(440,.12,'square',.05);
+  joy.id=null;joy.active=false;joy.mag=0;
   try{if(screen.orientation&&screen.orientation.lock)screen.orientation.lock('portrait').catch(()=>{})}catch(e){}
 }
 
@@ -192,16 +193,32 @@ function togglePause(){
 }
 let pausedFrom='play';
 addEventListener('keydown',e=>{if(e.key==='p'||e.key==='Escape')togglePause()});
-cv.addEventListener('pointermove',e=>{if(e.pointerId===boostPtr)return;pointer.x=e.clientX;pointer.y=e.clientY;if(e.pointerType==='mouse')pointer.active=true});
+// floating joystick: appears wherever a thumb lands, follows the thumb if dragged past its rim
+const joy={id:null,active:false,bx:0,by:0,kx:0,ky:0,alpha:0,ang:0,mag:0};
+const joyR=()=>Math.max(52,Math.min(cw,ch)*.15);
+function joyMove(x,y){
+  const R=joyR();let dx=x-joy.bx,dy=y-joy.by,d=Math.hypot(dx,dy);
+  if(d>R){const ex=d-R;joy.bx+=dx/d*ex;joy.by+=dy/d*ex;dx=x-joy.bx;dy=y-joy.by;d=R}
+  joy.kx=joy.bx+dx;joy.ky=joy.by+dy;
+  joy.mag=d/R;if(d>3)joy.ang=Math.atan2(dy,dx);
+}
+function buzz(ms){try{navigator.vibrate&&navigator.vibrate(ms)}catch(e){}}
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('pointermove',e=>{
+  if(e.pointerId===boostPtr)return;
+  if(e.pointerId===joy.id){joyMove(e.clientX,e.clientY);return}
+});
 cv.addEventListener('pointerdown',e=>{
   const h=hudHit(e.clientX,e.clientY);
   if(h==='pause'){togglePause();return}
-  if(h==='boost'){boostHeld=true;boostPtr=e.pointerId;return}
-  pointer.x=e.clientX;pointer.y=e.clientY;pointer.active=true;if(e.pointerType==='mouse')boostHeld=true;
+  if(h==='boost'){boostHeld=true;boostPtr=e.pointerId;buzz(15);return}
+  if(joy.id!==null)return; // one pointer steers (thumb or mouse drag)
+  try{cv.setPointerCapture(e.pointerId)}catch(_){}
+  joy.id=e.pointerId;joy.active=true;joy.bx=joy.kx=e.clientX;joy.by=joy.ky=e.clientY;joy.mag=0;
 });
 function ptrUp(e){
   if(e.pointerId===boostPtr){boostHeld=false;boostPtr=null;return}
-  if(e.pointerType==='mouse')boostHeld=false;else pointer.active=false;
+  if(e.pointerId===joy.id){joy.id=null;joy.active=false;joy.mag=0;return}
 }
 cv.addEventListener('pointerup',ptrUp);cv.addEventListener('pointercancel',ptrUp);
 
@@ -219,6 +236,7 @@ function playerSteer(b,dt){
   if(keys['w']||keys['arrowup'])ay-=1;if(keys['s']||keys['arrowdown'])ay+=1;
   let want=null;
   if(ax||ay)want=Math.atan2(ay,ax);
+  else if(joy.active&&joy.mag>.18)want=joy.ang;
   else if(pointer.active){
     const dx=pointer.x-cw/2,dy=pointer.y-ch/2;
     if(Math.hypot(dx,dy)>28)want=Math.atan2(dy,dx);
@@ -281,7 +299,7 @@ function shrink(b,carriages,label){
   b.ang+=Math.PI*.75*(Math.random()<.5?1:-1);
   for(let i=0;i<14;i++)parts.push({x:b.x,y:b.y,vx:rnd(-260,260),vy:rnd(-260,260),life:.6,c:'#ffd23f'});
   floats.push({x:b.x,y:b.y-30,t:1.2,txt:lost>0?`${label} -${lost*CAP_PER_CARRIAGE} cap 💥`:'BONK!',c:'#ff6b6b'});
-  if(b===player)beep(120,.25,'sawtooth',.09,-60);
+  if(b===player){beep(120,.25,'sawtooth',.09,-60);buzz([60,40,90])}
 }
 // head hits another bus's body -> back to initial capacity
 function crash(b){shrink(b,1,'CRASH')}
@@ -652,6 +670,24 @@ function drawHUD(t){
   else{rr(848,1554,14,44,5);ctx.fill();rr(872,1554,14,44,5);ctx.fill()}
   ctx.restore();
 
+  // floating joystick (screen space, fades in/out)
+  joy.alpha+=((joy.active?1:0)-joy.alpha)*.25;
+  if(joy.alpha>.02){
+    const R=joyR();ctx.save();ctx.globalAlpha=joy.alpha;
+    ctx.fillStyle='rgba(255,255,255,.12)';ctx.beginPath();ctx.arc(joy.bx,joy.by,R,0,7);ctx.fill();
+    ctx.lineWidth=4;ctx.strokeStyle='rgba(255,255,255,.5)';ctx.stroke();
+    ctx.lineWidth=2;ctx.strokeStyle='rgba(255,255,255,.22)';ctx.beginPath();ctx.arc(joy.bx,joy.by,R*.55,0,7);ctx.stroke();
+    if(joy.mag>.18){ // direction chevron on the rim
+      ctx.save();ctx.translate(joy.bx,joy.by);ctx.rotate(joy.ang);ctx.fillStyle='rgba(255,255,255,.75)';
+      ctx.beginPath();ctx.moveTo(R+12,0);ctx.lineTo(R-4,-9);ctx.lineTo(R-4,9);ctx.closePath();ctx.fill();ctx.restore();
+    }
+    const g=ctx.createRadialGradient(joy.kx-6,joy.ky-8,2,joy.kx,joy.ky,R*.46);
+    g.addColorStop(0,'rgba(255,255,255,.95)');g.addColorStop(1,'rgba(190,210,255,.7)');
+    ctx.fillStyle='rgba(0,0,0,.2)';ctx.beginPath();ctx.arc(joy.kx+2,joy.ky+5,R*.42,0,7);ctx.fill();
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(joy.kx,joy.ky,R*.42,0,7);ctx.fill();
+    ctx.restore();
+  }
+
   // countdown / paused
   if(state==='count'){
     const n=Math.ceil(countdown-.4);
@@ -710,7 +746,7 @@ function loop(now){
 }
 requestAnimationFrame(loop);
 // test hook
-window.__game={crash,endGame,get state(){return state},get buses(){return buses},get pass(){return pass}};
+window.__game={crash,endGame,joy,get state(){return state},get buses(){return buses},get pass(){return pass}};
 })();
 </script>
 </body>
