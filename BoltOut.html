@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Bolt and Thread</title>
+<style>
+  :root{--bg:#f6ecd9;--ink:#3b2a20;--panel:#fffaf0;--accent:#e4572e}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS",system-ui,sans-serif;overflow:hidden;touch-action:none;user-select:none}
+  #app{height:100%;display:flex;flex-direction:column;align-items:center}
+  #hud{width:100%;max-width:520px;height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;gap:8px;flex:none}
+  .pill{background:var(--panel);border-radius:20px;padding:7px 14px;font-weight:700;font-size:15px;box-shadow:0 2px 0 #d9c7a5;white-space:nowrap}
+  #hearts{letter-spacing:2px;color:var(--accent)}
+  button{font:inherit;font-weight:700;border:0;border-radius:20px;padding:8px 14px;background:var(--accent);color:#fff;cursor:pointer;box-shadow:0 3px 0 #a73a1b}
+  button:active{transform:translateY(2px);box-shadow:0 1px 0 #a73a1b}
+  button.ghost{background:var(--panel);color:var(--ink);box-shadow:0 3px 0 #d9c7a5}
+  button:disabled{opacity:.45}
+  #wrap{flex:1;min-height:0;width:100%;display:flex;align-items:center;justify-content:center;padding-bottom:8px}
+  canvas{display:block;border-radius:22px;box-shadow:0 10px 30px rgba(80,50,20,.25)}
+  #modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(59,42,32,.55);z-index:5}
+  #modal.show{display:flex}
+  #card{background:var(--panel);border-radius:24px;padding:28px 34px;text-align:center;max-width:320px;box-shadow:0 14px 50px rgba(0,0,0,.4);animation:pop .3s ease}
+  #card h2{margin:0 0 6px;font-size:30px;color:var(--accent)}
+  #card p{margin:0 0 18px;line-height:1.4}
+  @keyframes pop{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="hud">
+    <div class="pill">Lv <b id="lvl">1</b></div>
+    <div class="pill" id="hearts"></div>
+    <div class="pill">Left <b id="left">0</b></div>
+    <button class="ghost" id="hint">Hint <span id="hn">3</span></button>
+    <button class="ghost" id="restart">&#8635;</button>
+  </div>
+  <div id="wrap"><canvas id="c"></canvas></div>
+</div>
+<div id="modal"><div id="card"><h2 id="mt"></h2><p id="mp"></p><button id="mb"></button></div></div>
+
+<script>
+(() => {
+"use strict";
+const W = 420, H = 640;
+const COLORS = ['#e4572e','#f2a541','#2a9d8f','#3a86c8','#8e5bd6','#e86a9a','#6a994e'];
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+const rand = (a, b) => a + Math.random() * (b - a);
+const ri = (a, b) => Math.floor(rand(a, b + 1));
+const DIRS = [[1,0],[-1,0],[0,1],[0,-1]];
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16), r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const f = v => Math.max(0, Math.min(255, Math.round(amt >= 0 ? v + (255 - v) * amt : v * (1 + amt))));
+  return `rgb(${f(r)},${f(g)},${f(b)})`;
+}
+let actx;
+function beep(f, d = .1, type = 'sine', v = .1, slide = 0) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain(), t = actx.currentTime;
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (slide) o.frequency.linearRampToValueAtTime(f + slide, t + d);
+    g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(.001, t + d);
+    o.connect(g); g.connect(actx.destination); o.start(); o.stop(t + d);
+  } catch (e) {}
+}
+
+// ---------- state ----------
+let level = 1, cols, rows, cs, ox, oy, threads = [], lives = 3, hints = 3, status = 'play';
+let hintId = -1, hintT = 0, parts = [], flash = 0;
+try { level = Math.max(1, +localStorage.getItem('boltthread.level') || 1); } catch (e) {}
+
+const inGrid = (c, r) => c >= 0 && r >= 0 && c < cols && r < rows;
+
+// ---------- generation ----------
+function generate(lv) {
+  cols = Math.min(5 + Math.floor((lv + 1) / 2), 10);
+  rows = Math.min(cols + 3, 14);
+  const availW = W - 24, availH = H - 24;
+  cs = Math.floor(Math.min(availW / cols, availH / rows));
+  ox = (W - cs * cols) / 2; oy = (H - cs * rows) / 2;
+  const occ = new Map(); // "c,r" -> thread
+  threads = [];
+  const nColors = Math.min(3 + Math.floor(lv / 2), COLORS.length);
+  let fails = 0, id = 0;
+  while (fails < 400) {
+    const len = ri(3, Math.min(5 + Math.floor(lv / 2), 10));
+    // random walk
+    let c = ri(0, cols - 1), r = ri(0, rows - 1);
+    if (occ.has(c + ',' + r)) { fails++; continue; }
+    const cells = [[c, r]], mine = new Set([c + ',' + r]);
+    let tries = 0;
+    while (cells.length < len && tries++ < 30) {
+      const [dx, dy] = DIRS[ri(0, 3)];
+      const nc = c + dx, nr = r + dy, k = nc + ',' + nr;
+      if (!inGrid(nc, nr) || occ.has(k) || mine.has(k)) continue;
+      c = nc; r = nr; cells.push([c, r]); mine.add(k);
+    }
+    if (cells.length < 3) { fails++; continue; }
+    // head = last cell; direction can't point into the body
+    const [hc, hr] = cells[cells.length - 1], [pc, pr] = cells[cells.length - 2];
+    const options = DIRS.filter(([dx, dy]) => !(hc + dx === pc && hr + dy === pr));
+    options.sort(() => Math.random() - .5);
+    let dir = null;
+    for (const [dx, dy] of options) {
+      // ray must avoid every already-placed thread (guarantees a solvable order)
+      let ok = true, x = hc + dx, y = hr + dy;
+      while (inGrid(x, y)) { if (occ.has(x + ',' + y) || mine.has(x + ',' + y)) { ok = false; break; } x += dx; y += dy; }
+      if (ok) { dir = [dx, dy]; break; }
+    }
+    if (!dir) { fails++; continue; }
+    const t = {id: id++, cells, dir, color: COLORS[ri(0, nColors - 1)], s: 0, v: 0, phase: 'idle', spin: 0, shake: 0, done: false};
+    t.len = cells.length;
+    let rayIn = 0, x = hc + dir[0], y = hr + dir[1];
+    while (inGrid(x, y)) { rayIn++; x += dir[0]; y += dir[1]; }
+    t.rayIn = rayIn;
+    const pts = cells.map(([a, b]) => [a, b]);
+    const extra = rayIn + t.len + 3;
+    for (let k = 1; k <= extra; k++) pts.push([hc + dir[0] * k, hr + dir[1] * k]);
+    t.path = pts;
+    for (const [a, b] of cells) occ.set(a + ',' + b, t);
+    threads.push(t);
+  }
+  // later-placed threads sit on top visually
+}
+
+function blocked(t) {
+  const [hc, hr] = t.cells[t.cells.length - 1];
+  let x = hc + t.dir[0], y = hr + t.dir[1];
+  while (inGrid(x, y)) {
+    for (const o of threads) {
+      if (o === t || o.done || o.phase === 'slide') continue;
+      if (o.cells.some(([a, b]) => a === x && b === y)) return o;
+    }
+    x += t.dir[0]; y += t.dir[1];
+  }
+  return null;
+}
+function freeThreads() { return threads.filter(t => !t.done && t.phase === 'idle' && !blocked(t)); }
+
+// ---------- geometry ----------
+const cx = c => ox + (c + .5) * cs, cy = r => oy + (r + .5) * cs;
+function pointAt(t, d) { // d = distance (in cells) along path
+  const i = Math.max(0, Math.min(t.path.length - 1, Math.floor(d))), j = Math.min(t.path.length - 1, i + 1), f = d - i;
+  const a = t.path[i], b = t.path[j];
+  return {x: cx(a[0] + (b[0] - a[0]) * f), y: cy(a[1] + (b[1] - a[1]) * f)};
+}
+function body(t) { // polyline from tail (s) to head (s+len-1)
+  const a = t.s, b = t.s + t.len - 1, pts = [pointAt(t, a)];
+  for (let i = Math.floor(a) + 1; i < b; i++) pts.push(pointAt(t, i));
+  pts.push(pointAt(t, b));
+  return pts;
+}
+
+// ---------- drawing ----------
+function drawThread(t) {
+  const pts = body(t);
+  const sx = t.shake > 0 ? Math.sin(t.shake * 80) * 3 : 0;
+  ctx.save(); ctx.translate(sx, 0);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const path = () => { ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y); };
+  const w = cs * .52;
+  ctx.strokeStyle = 'rgba(70,40,10,.22)'; ctx.lineWidth = w + 2; ctx.save(); ctx.translate(2, 3); path(); ctx.stroke(); ctx.restore();
+  ctx.strokeStyle = shade(t.color, -.25); ctx.lineWidth = w + 2; path(); ctx.stroke();
+  ctx.strokeStyle = t.color; ctx.lineWidth = w - 2; path(); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = 2; ctx.setLineDash([3, cs * .28]);
+  ctx.save(); ctx.translate(0, -w * .18); path(); ctx.stroke(); ctx.restore(); ctx.setLineDash([]);
+  // bolt at head
+  const h = pts[pts.length - 1];
+  let bx = h.x, by = h.y, scale = 1, rot = t.spin;
+  if (t.phase === 'unscrew') scale = 1 + .5 * Math.sin(Math.PI * Math.min(1, t.spin / 6.3));
+  const R = cs * .3 * scale;
+  ctx.fillStyle = 'rgba(0,0,0,.28)'; ctx.beginPath(); ctx.arc(bx + 2, by + 3, R, 0, 7); ctx.fill();
+  const g = ctx.createRadialGradient(bx - R * .3, by - R * .4, 1, bx, by, R);
+  g.addColorStop(0, '#f3f3f0'); g.addColorStop(1, '#8b8f99');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(bx, by, R, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#4a4d57'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.save(); ctx.translate(bx, by); ctx.rotate(rot);
+  ctx.strokeStyle = '#3c3f48'; ctx.lineWidth = Math.max(2, R * .22); ctx.beginPath(); ctx.moveTo(-R * .6, 0); ctx.lineTo(R * .6, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, -R * .6); ctx.lineTo(0, R * .6); ctx.stroke();
+  ctx.restore();
+  // direction arrow
+  if (t.phase === 'idle') {
+    const [dx, dy] = t.dir, ax = bx + dx * (R + 5), ay = by + dy * (R + 5), s = cs * .15;
+    ctx.fillStyle = shade(t.color, -.45);
+    ctx.beginPath(); ctx.moveTo(ax + dx * s * 1.3, ay + dy * s * 1.3); ctx.lineTo(ax - dy * s, ay + dx * s); ctx.lineTo(ax + dy * s, ay - dx * s); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  // board
+  ctx.fillStyle = '#fffaf0'; ctx.beginPath(); ctx.roundRect(4, 4, W - 8, H - 8, 22); ctx.fill();
+  ctx.save();
+  ctx.beginPath(); ctx.roundRect(4, 4, W - 8, H - 8, 22); ctx.clip();
+  // pegs
+  ctx.fillStyle = '#e3d3b4';
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { ctx.beginPath(); ctx.arc(cx(c), cy(r), 3, 0, 7); ctx.fill(); }
+  const order = [...threads].sort((a, b) => (a.phase === 'slide') - (b.phase === 'slide'));
+  for (const t of order) if (!t.done) drawThread(t);
+  // hint ring
+  if (hintId >= 0 && hintT > 0) {
+    const t = threads.find(x => x.id === hintId && !x.done);
+    if (t) {
+      const [hc, hr] = t.cells[t.cells.length - 1];
+      ctx.strokeStyle = '#2a9d8f'; ctx.lineWidth = 4; ctx.globalAlpha = .5 + .5 * Math.sin(time * 10);
+      ctx.beginPath(); ctx.arc(cx(hc), cy(hr), cs * .55, 0, 7); ctx.stroke(); ctx.globalAlpha = 1;
+    }
+  }
+  for (const p of parts) { ctx.globalAlpha = 1 - p.t / p.life; ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  if (flash > 0) { ctx.fillStyle = `rgba(228,87,46,${flash * .35})`; ctx.fillRect(0, 0, W, H); }
+  ctx.restore();
+}
+
+// ---------- update ----------
+let time = 0;
+function update(dt) {
+  time += dt; flash = Math.max(0, flash - dt * 3); hintT = Math.max(0, hintT - dt);
+  for (const t of threads) {
+    t.shake = Math.max(0, t.shake - dt);
+    if (t.phase === 'unscrew') {
+      t.spin += dt * 22;
+      if (t.spin >= 6.3) { t.phase = 'slide'; t.v = 3; }
+    } else if (t.phase === 'slide') {
+      t.v = Math.min(18, t.v + 50 * dt); t.s += t.v * dt;
+      if (t.s > t.len - 1 + t.rayIn + 1.2) { t.done = true; }
+    }
+  }
+  for (const p of parts) { p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 600 * dt; }
+  parts = parts.filter(p => p.t < p.life);
+  const left = threads.filter(t => !t.done).length;
+  $('left').textContent = left;
+  if (status === 'play' && left === 0) {
+    status = 'won';
+    try { localStorage.setItem('boltthread.level', level + 1); } catch (e) {}
+    [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => beep(f, .2, 'triangle', .1), i * 110));
+    setTimeout(() => modal('All unthreaded!', `Level ${level} cleared with ${lives} ${lives === 1 ? 'life' : 'lives'} left.`, 'Next level', () => { level++; start(); }), 500);
+  }
+}
+
+// ---------- input ----------
+canvas.addEventListener('pointerdown', e => {
+  if (status !== 'play') return;
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * W / r.width, y = (e.clientY - r.top) * H / r.height;
+  let best = null, bd = Infinity;
+  for (const t of threads) {
+    if (t.done || t.phase !== 'idle') continue;
+    for (const [a, b] of t.cells) {
+      const d = Math.hypot(cx(a) - x, cy(b) - y);
+      const isHead = a === t.cells[t.cells.length - 1][0] && b === t.cells[t.cells.length - 1][1];
+      const score = d - (isHead ? cs * .25 : 0);
+      if (d < cs * .55 && score < bd) { bd = score; best = t; }
+    }
+  }
+  if (!best) return;
+  if (blocked(best)) {
+    best.shake = .35; flash = 1; beep(150, .2, 'square', .08, -40);
+    lives--; renderHearts();
+    if (lives <= 0) {
+      status = 'lost';
+      setTimeout(() => modal('Tangled up!', 'You ran out of lives. Check which way each arrow points before pulling.', 'Try again', start), 500);
+    }
+    return;
+  }
+  best.phase = 'unscrew'; best.spin = 0; hintT = 0;
+  beep(480, .18, 'triangle', .1, 320);
+  const h = best.cells[best.cells.length - 1];
+  for (let i = 0; i < 6; i++) parts.push({x: cx(h[0]), y: cy(h[1]), vx: rand(-90, 90), vy: rand(-200, -60), t: 0, life: rand(.3, .6), r: rand(2, 4), color: best.color});
+});
+$('hint').onclick = () => {
+  if (status !== 'play' || hints <= 0) return;
+  const f = freeThreads(); if (!f.length) return;
+  hints--; $('hn').textContent = hints; hintId = f[ri(0, f.length - 1)].id; hintT = 2.5;
+};
+$('restart').onclick = start;
+
+function renderHearts() { $('hearts').textContent = '♥'.repeat(Math.max(0, lives)) + '♡'.repeat(Math.max(0, 3 - lives)); }
+function modal(t, p, b, fn) {
+  $('mt').textContent = t; $('mp').textContent = p; $('mb').textContent = b;
+  $('mb').onclick = () => { $('modal').classList.remove('show'); fn(); };
+  $('modal').classList.add('show');
+}
+function start() {
+  $('modal').classList.remove('show');
+  lives = 3; hints = 3; status = 'play'; hintId = -1; parts = [];
+  $('lvl').textContent = level; $('hn').textContent = hints; renderHearts();
+  generate(level);
+}
+
+function fit() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2), wrap = $('wrap');
+  const s = Math.min((wrap.clientWidth - 8) / W, (wrap.clientHeight - 4) / H);
+  canvas.style.width = W * s + 'px'; canvas.style.height = H * s + 'px';
+  canvas.width = W * s * dpr; canvas.height = H * s * dpr;
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+}
+window.addEventListener('resize', fit);
+let last = performance.now();
+function frame(n) { const dt = Math.min(.05, (n - last) / 1000); last = n; update(dt); draw(); requestAnimationFrame(frame); }
+fit(); start(); requestAnimationFrame(frame);
+window.__game = {get threads() { return threads; }, get status() { return status; }, freeThreads, blocked};
+})();
+</script>
+</body>
+</html>
